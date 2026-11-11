@@ -1,0 +1,306 @@
+/**
+ * Codex + Claude subscription quota footer for Pi.
+ *
+ * The status line (`ctx.ui.setStatus("quota", …)`) follows the model you have
+ * active. Modes: auto (default), codex, claude, both. Settings persist in
+ * `<agentDir>/quota-usage.json`; credentials are never written or logged.
+ */
+
+import { type ExtensionAPI, type ExtensionContext, getAgentDir, readStoredCredential } from "@earendil-works/pi-coding-agent";
+
+import { createQuotaClient, legacyErrorStatus } from "./codex-usage.ts";
+import type { QuotaProvider, QuotaSnapshot } from "./quota-model.ts";
+import { createClaudeQuotaClient, isQuotaFailure } from "./claude-usage.ts";
+import {
+	claudeProviderIds,
+	codexProviderIds,
+	createSettingsStore,
+	detectCredentialKinds,
+	providerKind,
+	QUOTA_MODE_INFO,
+	QUOTA_MODES,
+	resolveTargets,
+	subscriptionForProvider,
+	type QuotaMode,
+	type ResolvedTargets,
+} from "./quota-settings.ts";
+import { formatDetailedReport, formatStatusLine, legacyCodexDetail, type QuotaEntry } from "./quota-display.ts";
+
+export const STATUS_KEY = "quota";
+/** Status keys that existed before multi-provider support, cleared defensively. */
+const LEGACY_STATUS_KEYS = ["codex-quota"];
+const REFRESH_INTERVAL_MS = 60_000;
+/** Age at which cached data is labeled stale in the footer. */
+const STALE_AFTER_MS = 5 * 60_000;
+/** Failures fresher than this keep showing recent data without a stale marker. */
+const RECENT_SUCCESS_MS = 90_000;
+
+interface Poller {
+	get(force: boolean): Promise<QuotaSnapshot>;
+	peek(): QuotaSnapshot | undefined;
+}
+
+export default function (pi: ExtensionAPI) {
+	const settings = createSettingsStore(getAgentDir());
+	const claudeIds = claudeProviderIds();
+	const codexIds = codexProviderIds();
+	// Set whenever a context is available; lets the Claude client route stale-token
+	// refresh through Pi's own auth resolution instead of trusting the stored stamp.
+	let registry: ExtensionContext["modelRegistry"] | undefined;
+	const codexClient = createQuotaClient(readStoredCredential, fetch);
+	const claudeClient = createClaudeQuotaClient({
+		readCredential: readStoredCredential,
+		fetcher: fetch,
+		// The Claude credential is read from the "anthropic" provider id, so the
+		// refresh targets that id rather than the claudeProviderIds() aliases.
+		refreshCredential: async () => {
+			await registry?.getProviderAuth("anthropic");
+		},
+	});
+
+	const pollers: Record<QuotaProvider, Poller> = {
+		codex: { get: (force) => codexClient.fetchUsage(force), peek: () => codexClient.getCache() },
+		claude: { get: (force) => claudeClient.getQuota(force), peek: () => claudeClient.peek() },
+	};
+
+	let chain: Promise<unknown> = Promise.resolve();
+	let timer: ReturnType<typeof setInterval> | undefined;
+	let lastTargets: ResolvedTargets | undefined;
+	let clearedLegacyKeys = false;
+
+	function fallbackFor(provider: QuotaProvider, message?: string): string {
+		if (!message) return provider === "codex" ? "Codex: N/A" : "Claude: N/A";
+		if (provider === "codex") return legacyErrorStatus(message);
+		return message.startsWith("Claude:") ? message : "Claude: N/A";
+	}
+
+	function errorCodeOf(provider: QuotaProvider, error: unknown, message: string): string {
+		if (provider === "codex") return message.startsWith("Codex: Auth") ? "auth-expired" : "other";
+		return isQuotaFailure(error) ? error.code : "other";
+	}
+
+	async function poll(ctx: ExtensionContext, provider: QuotaProvider, force: boolean): Promise<QuotaEntry> {
+		registry = ctx.modelRegistry;
+		const now = Date.now();
+		const poller = pollers[provider];
+		try {
+			const snapshot = await poller.get(force);
+			const age = now - snapshot.fetchedAt;
+			return { provider, snapshot, fallback: fallbackFor(provider), staleMs: age > STALE_AFTER_MS ? age : undefined };
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			const cached = poller.peek();
+			const age = cached ? now - cached.fetchedAt : 0;
+			return {
+				provider,
+				snapshot: cached,
+				error: { code: errorCodeOf(provider, error, message), message },
+				fallback: fallbackFor(provider, message),
+				staleMs: cached && age > RECENT_SUCCESS_MS ? age : undefined,
+			};
+		}
+	}
+
+	function render(ctx: ExtensionContext, entries: QuotaEntry[], targets: ResolvedTargets): void {
+		if (!ctx.hasUI) return;
+		if (!clearedLegacyKeys) {
+			clearedLegacyKeys = true;
+			// One status slot per quota line; drop the pre-upgrade key if present.
+			for (const key of LEGACY_STATUS_KEYS) ctx.ui.setStatus(key, undefined);
+		}
+		lastTargets = targets;
+		ctx.ui.setStatus(
+			STATUS_KEY,
+			formatStatusLine(entries, {
+				short: entries.length > 1,
+				paint: (token, text) => ctx.ui.theme.fg(token as Parameters<typeof ctx.ui.theme.fg>[0], text),
+			}),
+		);
+	}
+
+	/** Re-render from cache only (no network), used by header capture. */
+	function renderFromCache(ctx: ExtensionContext): void {
+		if (!ctx.hasUI || !lastTargets) return;
+		const now = Date.now();
+		const entries = lastTargets.targets.map((provider): QuotaEntry => {
+			const snapshot = pollers[provider].peek();
+			const age = snapshot ? now - snapshot.fetchedAt : 0;
+			return { provider, snapshot, fallback: fallbackFor(provider), staleMs: snapshot && age > STALE_AFTER_MS ? age : undefined };
+		});
+		render(ctx, entries, lastTargets);
+	}
+
+	async function refresh(ctx: ExtensionContext, force = false): Promise<{ entries: QuotaEntry[]; targets: ResolvedTargets }> {
+		const config = settings.read();
+		const activeProvider = ctx.model?.provider;
+		// "auto" with a local model needs to know which accounts exist; the rest
+		// of the resolution paths never touch credentials.
+		const credentialKinds = config.mode === "auto" && !providerKind(activeProvider, claudeIds, codexIds) ? detectCredentialKinds(readStoredCredential) : undefined;
+		const targets = resolveTargets({
+			mode: config.mode,
+			activeProvider,
+			lastSubscriptionProvider: config.lastSubscriptionProvider,
+			credentialKinds,
+			claudeIds,
+			codexIds,
+		});
+		const entries = await Promise.all(targets.targets.map((provider) => poll(ctx, provider, force)));
+		if (credentialKinds?.claude === "oauth-no-usage") {
+			for (const entry of entries) {
+				if (entry.provider === "claude" && entry.error && entry.error.code !== "auth-unavailable") entry.error.code = "oauth-no-usage";
+			}
+		}
+		render(ctx, entries, targets);
+		return { entries, targets };
+	}
+
+	/**
+	 * Runs refreshes one at a time (the 60s timer, turn end, model select, and
+	 * commands all share this). Calls queue instead of being dropped, so a footer
+	 * update that arrives during a slow provider call is never lost.
+	 */
+	function refreshExclusive(ctx: ExtensionContext, force = false) {
+		const run = () => refresh(ctx, force);
+		const result = chain.then(run, run).catch(() => undefined);
+		chain = result.then(() => undefined);
+		return result;
+	}
+
+	const modeSummary = (mode: QuotaMode): string => `${mode} — ${QUOTA_MODE_INFO[mode]}`;
+
+	function notifyMode(ctx: ExtensionContext, mode: QuotaMode, entries: QuotaEntry[]): void {
+		ctx.ui.notify(`${modeSummary(mode)}\n${formatStatusLine(entries, { short: entries.length > 1 })}`, "info");
+	}
+
+	async function reportEntry(ctx: ExtensionContext, entry: QuotaEntry, reason: string): Promise<void> {
+		const config = settings.read();
+		const unavailable = !entry.snapshot;
+		ctx.ui.notify(
+			formatDetailedReport([entry], {
+				mode: config.mode,
+				reason: entry.snapshot ? reason : `${entry.error?.message ?? "quota unavailable"} — run /login and choose ${entry.provider === "claude" ? "anthropic" : "openai-codex"}`,
+			}),
+			unavailable ? "warning" : "info",
+		);
+	}
+
+	pi.registerCommand("quota-provider", {
+		description: "Show or set which subscription quota the footer displays (auto, codex, claude, both)",
+		getArgumentCompletions: (argumentPrefix: string) => {
+			const word = argumentPrefix.trim().toLowerCase();
+			const candidates = [...QUOTA_MODES, "list"];
+			return candidates
+				.filter((value) => !word || value.startsWith(word))
+				.map((value) => ({ value, label: value, description: QUOTA_MODE_INFO[value as QuotaMode] }));
+		},
+		handler: async (args, ctx) => {
+			const config = settings.read();
+			const argument = args.trim().toLowerCase();
+
+			if (!argument) {
+				if (!ctx.hasUI) {
+					ctx.ui.notify(`Quota provider mode: ${config.mode}\n${QUOTA_MODES.map(modeSummary).join("\n")}`, "info");
+					return;
+				}
+				const choice = await ctx.ui.select("Quota provider mode", QUOTA_MODES.map((mode) => `${mode} — ${QUOTA_MODE_INFO[mode]}`));
+				if (!choice) {
+					ctx.ui.notify(`Quota provider mode: ${config.mode} (unchanged)`, "info");
+					return;
+				}
+				const mode = QUOTA_MODES.find((candidate) => choice.startsWith(candidate));
+				if (!mode) return;
+				notifyMode(ctx, settings.write({ mode }).mode, (await refreshExclusive(ctx, true))?.entries ?? []);
+				return;
+			}
+
+			if (argument === "list") {
+				ctx.ui.notify(`Quota provider mode: ${config.mode}\n${QUOTA_MODES.map(modeSummary).join("\n")}`, "info");
+				return;
+			}
+
+			const mode = QUOTA_MODES.find((candidate) => candidate === argument);
+			if (!mode) {
+				ctx.ui.notify(`Unknown quota provider mode "${args.trim()}". ${QUOTA_MODES.map(modeSummary).join("; ")}`, "warning");
+				return;
+			}
+			const next = settings.write({ mode });
+			notifyMode(ctx, next.mode, (await refreshExclusive(ctx, true))?.entries ?? []);
+			if (settings.lastError) ctx.ui.notify(`Could not save quota settings: ${settings.lastError}`, "warning");
+		},
+	});
+
+	pi.registerCommand("quota", {
+		description: "Show subscription quotas for the providers the footer currently tracks",
+		handler: async (_args, ctx) => {
+			const result = await refreshExclusive(ctx, true);
+			if (!result) return;
+			const unavailable = result.entries.some((entry) => !entry.snapshot);
+			ctx.ui.notify(formatDetailedReport(result.entries, { mode: settings.read().mode, reason: result.targets.reason }), unavailable ? "warning" : "info");
+		},
+	});
+
+	pi.registerCommand("claude-quota", {
+		description: "Show Claude 5-hour, weekly and per-model subscription limits",
+		handler: async (_args, ctx) => {
+			const entry = await poll(ctx, "claude", true);
+			await reportEntry(ctx, entry, "showing Claude limits");
+		},
+	});
+
+	pi.registerCommand("codex-quota", {
+		description: "Show Codex 5-hour and weekly quota and reset times",
+		handler: async (_args, ctx) => {
+			const entry = await poll(ctx, "codex", true);
+			const detail = legacyCodexDetail(entry);
+			if (!detail) {
+				ctx.ui.notify("Codex quota unavailable. Check /login openai-codex; no credentials were changed.", "warning");
+				return;
+			}
+			const stale = entry.staleMs !== undefined ? `(stale ${Math.round(entry.staleMs / 1000)}s — last successful read)\n` : "";
+			ctx.ui.notify(`${stale}${detail}`, entry.error ? "warning" : "info");
+		},
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		void refreshExclusive(ctx);
+		if (timer) clearInterval(timer);
+		timer = setInterval(() => void refreshExclusive(ctx), REFRESH_INTERVAL_MS);
+	});
+
+	pi.on("model_select", async (event, ctx) => {
+		const kind = providerKind(event.model?.provider, claudeIds, codexIds);
+		if (kind) settings.write({ lastSubscriptionProvider: subscriptionForProvider(kind) });
+		void refreshExclusive(ctx);
+	});
+
+	// Passive capture of Claude rate-limit headers, so Claude numbers stay current
+	// while Pi is mid-turn even if the usage endpoint is unavailable.
+	pi.on("after_provider_response", async (event, ctx) => {
+		if (providerKind(ctx.model?.provider, claudeIds, codexIds) !== "claude") return;
+		if (claudeClient.ingestHeaders(event.headers)) renderFromCache(ctx);
+	});
+
+	pi.on("turn_end", async (_event, ctx) => {
+		// Keep the original behaviour: Codex gets a refresh right after a turn.
+		if (providerKind(ctx.model?.provider, claudeIds, codexIds) === "codex") void refreshExclusive(ctx);
+	});
+
+	pi.on("session_shutdown", async (_event, ctx) => {
+		if (timer) clearInterval(timer);
+		timer = undefined;
+		if (ctx.hasUI) {
+			ctx.ui.setStatus(STATUS_KEY, undefined);
+			for (const key of LEGACY_STATUS_KEYS) ctx.ui.setStatus(key, undefined);
+		}
+		lastTargets = undefined;
+	});
+}
+
+// Compatibility exports for the pre-upgrade entry points and tests.
+export { compactStatus, createQuotaClient, detailed, remainingLine, USAGE_URL, CODEX_CACHE_MS, CODEX_TIMEOUT_MS } from "./codex-usage.ts";
+export type { CodexQuotaClient, CredentialReader, Fetcher } from "./codex-usage.ts";
+export { claudeAuthScopes, claudeProviderIds, codexProviderIds, createSettingsStore, DEFAULT_SETTINGS, detectCredentialKinds, normalizeSettings, providerForSubscription, providerKind, QUOTA_MODES, QUOTA_MODE_INFO, QUOTA_SETTINGS_FILE, resolveTargets, subscriptionForProvider } from "./quota-settings.ts";
+export type { CredentialKind, QuotaSettings, ResolvedTargets, SettingsStore, SubscriptionProvider } from "./quota-settings.ts";
+export { ageText, clampPercent, formatAbsolute, PROVIDER_LABELS, remainingPercent, remainingText, resetText, usedText } from "./quota-model.ts";
+export type { ClaudeCredits, ModelQuotaWindow, QuotaMode, QuotaProvider, QuotaSnapshot, QuotaWindow } from "./quota-model.ts";
+export type { ClaudeQuotaClient, QuotaFailure } from "./claude-usage.ts";

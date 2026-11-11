@@ -1,0 +1,21 @@
+{
+	"$comment": "Development-only typecheck config. Pi loads the extension through its own jiti loader and does not read this file.",
+	"compilerOptions": {
+		"target": "ES2022",
+		"lib": ["ES2023"],
+		"module": "esnext",
+		"moduleResolution": "bundler",
+		"strict": true,
+		"noUncheckedIndexedAccess": true,
+		"exactOptionalPropertyTypes": false,
+		"noEmit": true,
+		"skipLibCheck": true,
+		"allowImportingTsExtensions": true,
+		"types": ["node"],
+		"verbatimModuleSyntax": true
+	},
+	"include": ["*.ts"],
+
+	// Unrelated leftover extension in this folder; not part of this extension.
+	"exclude": ["output-metrics.ts", "*.bak-20261108", "test.mjs"]
+}

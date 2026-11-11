@@ -1,0 +1,393 @@
+/**
+ * Claude subscription (Pro/Max) quota client.
+ *
+ * Two supported sources, both authenticated through credentials Pi already
+ * stored (no cookie scraping, no HTML parsing):
+ *
+ * 1. `GET https://api.anthropic.com/api/oauth/usage` — the OAuth usage endpoint
+ *    the Claude Code CLI polls every 5 minutes (observed live; not a documented
+ *    public API). Gives 5-hour + weekly utilization, per-model weekly limits
+ *    (Opus / Sonnet / OAuth apps), the seven-day breakdown, and usage credits.
+ * 2. Rate-limit headers on regular `/v1/messages` responses
+ *    (`anthropic-ratelimit-unified-5h-*`, `...-7d-*`). Captured passively from
+ *    Pi's own provider responses via the `after_provider_response` hook, so a
+ *    Claude quota can be displayed even when the usage endpoint is unavailable.
+ */
+
+import type { ClaudeCredits, ClaudeLimitRow, QuotaSnapshot, QuotaWindow } from "./quota-model.ts";
+import { clampPercent, toQuotaWindow } from "./quota-model.ts";
+
+/** Reader injected in tests; in production this is `readStoredCredential`. */
+export type CredentialReader = (provider: string) => unknown;
+
+export const CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
+export const CLAUDE_CACHE_MS = 60_000;
+export const CLAUDE_TIMEOUT_MS = 5_000;
+/** Beta headers required by the OAuth usage endpoint (same as Claude Code). */
+export const CLAUDE_BETA_HEADER = "oauth-2025-04-20,claude-code-20250219";
+
+export type ClaudeQuotaErrorCode =
+	| "auth-unavailable"
+	| "auth-expired"
+	| "api-key-auth"
+	| "network"
+	| "timeout"
+	| "unavailable"
+	| "malformed"
+	| "backoff";
+
+export interface QuotaFailure extends Error {
+	code: ClaudeQuotaErrorCode;
+}
+
+export function quotaError(code: ClaudeQuotaErrorCode, message: string): QuotaFailure {
+	const error = new Error(message) as QuotaFailure;
+	error.code = code;
+	return error;
+}
+
+export function isQuotaFailure(error: unknown): error is QuotaFailure {
+	return error instanceof Error && typeof (error as QuotaFailure).code === "string";
+}
+
+export interface ClaudeCredentialLike {
+	type?: string;
+	access?: string;
+	expires?: number;
+	key?: string;
+}
+
+export interface ClaudeQuotaClient {
+	/** Resolve Claude quota data, hitting the endpoint at most once per cache window. */
+	getQuota(force?: boolean): Promise<QuotaSnapshot>;
+	/** Cached Claude data even when expired (for stale display). */
+	peek(): QuotaSnapshot | undefined;
+	/** Store utilization from `anthropic-ratelimit-unified-*` headers; true when stored. */
+	ingestHeaders(headers: ClaudeHeaderRecord | undefined): boolean;
+	invalidate(): void;
+	/** Credential availability without touching the network. */
+	credentialKind(): "oauth" | "api-key" | "none";
+}
+
+export function createClaudeQuotaClient(options: {
+	readCredential: CredentialReader;
+	fetcher: typeof fetch;
+	/**
+	 * Called when the stored access token is past its `expires` stamp, so Pi can
+	 * take its own lazy refresh path (re-mint under the credential-store lock and
+	 * write the new token back) before the client declares the login dead. Once it
+	 * resolves the credential is re-read. Omit to keep the legacy behavior of
+	 * trusting the stored stamp as the final verdict.
+	 */
+	refreshCredential?: () => Promise<unknown>;
+	now?: () => number;
+	url?: string;
+	cacheMs?: number;
+	timeoutMs?: number;
+}): ClaudeQuotaClient {
+	const { readCredential, fetcher } = options;
+	const now = options.now ?? Date.now;
+	const url = options.url ?? CLAUDE_USAGE_URL;
+	const cacheMs = options.cacheMs ?? CLAUDE_CACHE_MS;
+	const timeoutMs = options.timeoutMs ?? CLAUDE_TIMEOUT_MS;
+
+	let cached: QuotaSnapshot | undefined;
+	let pending: Promise<QuotaSnapshot> | undefined;
+	let failedUntil = 0;
+
+	const credential = (): ClaudeCredentialLike | undefined => {
+		const raw = readCredential("anthropic");
+		return raw && typeof raw === "object" ? (raw as ClaudeCredentialLike) : undefined;
+	};
+
+	const credentialKind = (): "oauth" | "api-key" | "none" => {
+		const raw = credential();
+		if (!raw) return "none";
+		if (raw.type === "oauth") return raw.access ? "oauth" : "none";
+		if (raw.type === "api_key" || raw.key) return "api-key";
+		return "none";
+	};
+
+	/** True when the stored access token is at or past its expiry stamp. */
+	const isStale = (raw: ClaudeCredentialLike | undefined): boolean => !!raw?.expires && now() >= raw.expires;
+
+	/**
+	 * Throw the legacy-compatible error for a non-fetchable state.
+	 *
+	 * Pi re-mints stored OAuth tokens lazily on its own request path, so a stale
+	 * `expires` stamp in the credential store between uses is normal and does not
+	 * mean the account is logged out. Ask Pi to refresh once, then re-read,
+	 * before reporting the login as expired.
+	 */
+	const requireAuth = async (): Promise<string> => {
+		const kind = credentialKind();
+		let raw = credential();
+		if (kind === "none") throw quotaError("auth-unavailable", "Claude: Auth unavailable");
+		if (kind === "api-key") throw quotaError("api-key-auth", "Claude: N/A");
+		if (isStale(raw) && options.refreshCredential) {
+			try {
+				await options.refreshCredential();
+			} catch {
+				// A failed Pi refresh falls through to the expired verdict below.
+			}
+			raw = credential();
+		}
+		if (isStale(raw)) throw quotaError("auth-expired", "Claude: Auth expired");
+		const access = raw?.access;
+		if (!access) throw quotaError("auth-unavailable", "Claude: Auth unavailable");
+		return access;
+	};
+
+	const requestQuota = async (access: string): Promise<QuotaSnapshot> => {
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), timeoutMs);
+		let response: Awaited<ReturnType<typeof fetcher>>;
+		try {
+			response = await fetcher(url, {
+				headers: {
+					Authorization: `Bearer ${access}`,
+					"anthropic-beta": CLAUDE_BETA_HEADER,
+					"anthropic-version": "2023-06-01",
+					Accept: "application/json",
+					"User-Agent": "claude-cli/2.1.211 (external, pi-quota)",
+				},
+				signal: controller.signal,
+			});
+		} catch (error) {
+			// abort() may surface as DOMException("TimeoutError"/"AbortError") or a plain
+			// Error depending on the fetch implementation, so the signal is the source of truth.
+			if (controller.signal.aborted || (error instanceof Error && error.name === "AbortError")) throw quotaError("timeout", "Claude usage request timed out");
+			throw quotaError("network", `Claude usage request failed: ${(error as Error).message}`);
+		} finally {
+			clearTimeout(timeout);
+		}
+
+		if (response.status === 401 || response.status === 403) {
+			throw quotaError("auth-expired", `Claude usage HTTP ${response.status}`);
+		}
+		if (response.status === 429) {
+			const retryAfter = Number(response.headers?.get("retry-after") ?? 0);
+			failedUntil = Math.max(failedUntil, now() + (retryAfter > 0 && retryAfter < 3600 ? retryAfter * 1000 : CLAUDE_CACHE_MS));
+			throw quotaError("unavailable", "Claude usage rate limited");
+		}
+		if (!response.ok) throw quotaError("unavailable", `Claude usage HTTP ${response.status}`);
+
+		let payload: unknown;
+		try {
+			payload = await response.json();
+		} catch {
+			throw quotaError("malformed", "Claude usage returned non-JSON data");
+		}
+		const snapshot = parseClaudeUsagePayload(payload, now());
+		if (!snapshot) throw quotaError("malformed", "Claude usage returned no quota data");
+		cached = snapshot;
+		return snapshot;
+	};
+
+	const getQuota = async (force = false): Promise<QuotaSnapshot> => {
+		const current = now();
+		// Fresh data (endpoint OR header-derived) is used as-is; header data keeps
+		// the quota visible without ever polling when Pi is mid-turn.
+		if (!force && cached && current - cached.fetchedAt < cacheMs) return cached;
+		if (pending) return pending;
+		if (!force && current < failedUntil) throw quotaError("backoff", "Claude: N/A");
+
+		const access = await requireAuth();
+		const request = requestQuota(access).catch((error: unknown) => {
+			if (isQuotaFailure(error) && (error.code === "network" || error.code === "unavailable" || error.code === "malformed" || error.code === "timeout")) {
+				failedUntil = Math.max(failedUntil, now() + cacheMs);
+			}
+			throw error;
+		});
+
+		pending = request;
+		try {
+			return await request;
+		} finally {
+			if (pending === request) pending = undefined;
+		}
+	};
+
+	const ingestHeaders = (headers: ClaudeHeaderRecord | undefined): boolean => {
+		const headersSnapshot = parseClaudeUsageHeaders(headers, now());
+		if (!headersSnapshot) return false;
+		if (!cached) cached = headersSnapshot;
+		else {
+			// Keep endpoint-derived fields the headers do not carry.
+			if (headersSnapshot.fiveHour) cached.fiveHour = headersSnapshot.fiveHour;
+			if (headersSnapshot.weekly) cached.weekly = headersSnapshot.weekly;
+			if (headersSnapshot.limitReached) cached.limitReached = true;
+			cached.fetchedAt = headersSnapshot.fetchedAt;
+			if (cached.source === "endpoint") cached.source = "mixed";
+		}
+		return true;
+	};
+
+	return {
+		getQuota,
+		peek: () => cached,
+		ingestHeaders,
+		invalidate: () => {
+			cached = undefined;
+			failedUntil = 0;
+		},
+		credentialKind,
+	};
+}
+
+export interface ClaudeHeaderRecord {
+	[name: string]: string | undefined;
+}
+
+function headerNumber(headers: ClaudeHeaderRecord | undefined, name: string): number | undefined {
+	const raw = headers?.[name] ?? headers?.[name.toLowerCase()];
+	if (raw === undefined) return undefined;
+	const value = Number(raw);
+	return Number.isFinite(value) ? value : undefined;
+}
+
+function headerString(headers: ClaudeHeaderRecord | undefined, name: string): string | undefined {
+	return headers?.[name] ?? headers?.[name.toLowerCase()];
+}
+
+/**
+ * Normalize the utilization Claude reports as either a percent (45.0) or a
+ * fraction (0.45). Both shapes appear in the OAuth payloads Claude Code sends;
+ * `anthropic-ratelimit-unified-*-utilization` documents 0..1 fractions.
+ */
+export function toPercent(value: unknown): number | undefined {
+	if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+	return clampPercent(value > 0 && value <= 1 ? value * 100 : value);
+}
+
+/**
+ * Convert `anthropic-ratelimit-unified-*` headers into a snapshot.
+ * Returns undefined when no unified rate-limit headers are present.
+ */
+export function parseClaudeUsageHeaders(headers: ClaudeHeaderRecord | undefined, fetchedAt: number = Date.now()): QuotaSnapshot | undefined {
+	if (!headers) return undefined;
+	const fiveHourUsed = toPercent(headerNumber(headers, "anthropic-ratelimit-unified-5h-utilization"));
+	const weeklyUsed = toPercent(headerNumber(headers, "anthropic-ratelimit-unified-7d-utilization"));
+	const status = headerString(headers, "anthropic-ratelimit-unified-status");
+	if (fiveHourUsed === undefined && weeklyUsed === undefined && !status) return undefined;
+
+	const secondsToMs = (value: number | undefined) => (value === undefined ? 0 : value * 1000);
+	const fiveHour = fiveHourUsed === undefined ? undefined : toQuotaWindow(fiveHourUsed, secondsToMs(headerNumber(headers, "anthropic-ratelimit-unified-5h-reset")));
+	const weekly = weeklyUsed === undefined ? undefined : toQuotaWindow(weeklyUsed, secondsToMs(headerNumber(headers, "anthropic-ratelimit-unified-7d-reset")));
+	const limitReached = headerString(headers, "anthropic-ratelimit-unified-reached") === "true" || (status !== undefined && status !== "allowed" && status !== "ok" && status !== "accept");
+
+	const snapshot: QuotaSnapshot = { provider: "claude", fetchedAt, source: "headers", fiveHour, weekly };
+	if (limitReached) snapshot.limitReached = true;
+	return snapshot;
+}
+
+function isoMs(value: unknown): number {
+	if (typeof value === "number" && Number.isFinite(value)) return value > 1e12 ? value : value * 1000;
+	if (typeof value === "string") {
+		const parsed = Date.parse(value);
+		if (!Number.isNaN(parsed)) return parsed;
+		const seconds = Number(value);
+		if (Number.isFinite(seconds)) return seconds > 1e12 ? seconds : seconds * 1000;
+	}
+	return 0;
+}
+
+interface ClaudeWindowPayload {
+	utilization?: unknown;
+	resets_at?: unknown;
+	weekly_reset_at?: unknown;
+}
+
+function windowFromPayload(payload: ClaudeWindowPayload | null | undefined): QuotaWindow | undefined {
+	if (!payload || typeof payload !== "object") return undefined;
+	const resetAt = isoMs(payload.resets_at ?? payload.weekly_reset_at);
+	return toQuotaWindow(toPercent(payload.utilization), resetAt);
+}
+
+function parseCredits(usage: Record<string, unknown> | undefined): ClaudeCredits | undefined {
+	if (!usage || typeof usage !== "object") return undefined;
+	const system = usage.credits_system;
+	if (!system || typeof system !== "object") return undefined;
+	const entries = Object.values(system as Record<string, unknown>).filter((value): value is { enabled?: unknown; disabled_reason?: unknown; spend_limit_reached?: unknown } =>
+		!!value && typeof value === "object",
+	);
+	if (!entries.length) return undefined;
+	const enabled = entries.some((entry) => entry.enabled === true) || usage.has_credits === true;
+	const reasons = [...new Set(entries.map((entry) => (typeof entry.disabled_reason === "string" ? entry.disabled_reason : "")).filter(Boolean))];
+	const credits: ClaudeCredits = {
+		enabled,
+		disabledReason: enabled ? undefined : (reasons[0] ?? null),
+		spendLimitReached: entries.some((entry) => entry.spend_limit_reached === true) || usage.spend_limit_reached === true,
+	};
+	return credits;
+}
+
+function parseLimitRows(payload: Record<string, unknown>): ClaudeLimitRow[] {
+	const rows = Array.isArray(payload.limits) ? payload.limits : [];
+	const parsed: ClaudeLimitRow[] = [];
+	for (const row of rows) {
+		if (!row || typeof row !== "object") continue;
+		const record = row as Record<string, unknown>;
+		const severity = typeof record.severity === "string" ? record.severity : "normal";
+		if (severity === "normal") continue;
+		const limit = typeof record.limit === "string" ? record.limit : typeof record.limit_duration === "string" ? String(record.limit_duration) : "unknown";
+		parsed.push({
+			kind: typeof record.kind === "string" ? record.kind : "unknown",
+			limit,
+			percent: toPercent(record.utilization) ?? 0,
+			severity,
+			isActive: record.is_active === true,
+		});
+	}
+	return parsed;
+}
+
+function parseBreakdown(payload: Record<string, unknown>): { key: string; label: string; percent: number }[] | undefined {
+	const breakdown = payload.seven_day_breakdown;
+	if (!breakdown || typeof breakdown !== "object") return undefined;
+	const rows = (breakdown as { rows?: unknown }).rows;
+	if (!Array.isArray(rows)) return undefined;
+	const parsed: { key: string; label: string; percent: number }[] = [];
+	for (const row of rows) {
+		if (!row || typeof row !== "object") continue;
+		const record = row as Record<string, unknown>;
+		const percent = toPercent(record.utilization);
+		if (percent === undefined) continue;
+		parsed.push({
+			key: typeof record.key === "string" ? record.key : "unknown",
+			label: typeof record.label === "string" ? record.label : "Unknown",
+			percent,
+		});
+	}
+	return parsed.length ? parsed : undefined;
+}
+
+/**
+ * Convert the OAuth usage payload into a snapshot. Returns undefined when the
+ * payload carries no usable windows, so callers can surface `N/A`.
+ */
+export function parseClaudeUsagePayload(payload: unknown, fetchedAt: number = Date.now()): QuotaSnapshot | undefined {
+	if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+	const raw = payload as Record<string, unknown>;
+
+	const fiveHour = windowFromPayload(raw.five_hour as ClaudeWindowPayload | null);
+	const weekly = windowFromPayload(raw.seven_day as ClaudeWindowPayload | null);
+
+	const models: NonNullable<QuotaSnapshot["models"]> = [
+		{ key: "opus", label: "Opus", window: windowFromPayload(raw.seven_day_opus as ClaudeWindowPayload | null) },
+		{ key: "sonnet", label: "Sonnet", window: windowFromPayload(raw.seven_day_sonnet as ClaudeWindowPayload | null) },
+		{ key: "oauth-apps", label: "OAuth apps", window: windowFromPayload(raw.seven_day_oauth_apps as ClaudeWindowPayload | null) },
+	];
+	const breakdown = parseBreakdown(raw);
+	const credits = parseCredits(raw.usage as Record<string, unknown> | undefined);
+	const limitRows = parseLimitRows(raw);
+	if (!fiveHour && !weekly && !models.some((model) => model.window) && !breakdown && !credits && !limitRows.length) return undefined;
+
+	const snapshot: QuotaSnapshot = { provider: "claude", fetchedAt, source: "endpoint", fiveHour, weekly, models };
+	const reached = limitRows.some((row) => row.severity === "blocked" || row.severity === "rejected" || row.severity === "limited");
+	if (reached) snapshot.limitReached = true;
+	if (credits) snapshot.credits = credits;
+	if (breakdown) snapshot.breakdown = breakdown;
+	if (limitRows.length) snapshot.limitRows = limitRows;
+	return snapshot;
+}

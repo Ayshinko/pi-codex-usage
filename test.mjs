@@ -1,0 +1,674 @@
+/**
+ * Tests for the subscription quota footer extension.
+ *
+ * Offline and deterministic: PI_CODING_AGENT_DIR is pointed at an empty temp dir
+ * so no real credentials are read, and every failure mode is faked. Synthetic
+ * percentages appear only in display-layer tests, where the point is to check
+ * rendering. Real-data coverage lives in live-check.mjs.
+ *
+ * Run with: npm test
+ */
+
+import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+
+import { compactStatus, createQuotaClient, detailed } from "./codex-usage.ts";
+import { createClaudeQuotaClient, parseClaudeUsageHeaders, parseClaudeUsagePayload, toPercent } from "./claude-usage.ts";
+import { createSettingsStore, detectCredentialKinds, normalizeSettings, providerKind, resolveTargets } from "./quota-settings.ts";
+import { formatDetailedReport, formatStatusLine } from "./quota-display.ts";
+import extensionDefault, { STATUS_KEY } from "./index.ts";
+
+const NOW = 1_800_000_000_000;
+const tokenFor = (expMs) => `x.${Buffer.from(JSON.stringify({ exp: Math.floor(expMs / 1000) })).toString("base64url")}.y`;
+
+// --------------------------------------------------------------------------------
+// Codex client — the behavior of the original single-provider test, preserved.
+// --------------------------------------------------------------------------------
+
+test("codex client reports, caches, and refreshes like before", async () => {
+	let calls = 0;
+	let now = NOW;
+	const token = tokenFor(now + 3_600_000);
+	const credential = { type: "oauth", access: token, accountId: "fake-id", refresh: "must-not-be-used" };
+	const mockFetch = async (_url, init) => {
+		calls++;
+		assert.equal(init.headers["ChatGPT-Account-Id"], "fake-id");
+		assert.equal(init.headers.Authorization, `Bearer ${token}`);
+		assert.equal(init.signal.aborted, false);
+		return new Response(
+			JSON.stringify({
+				plan_type: "plus",
+				rate_limit: {
+					primary_window: { used_percent: 28, limit_window_seconds: 18000, reset_at: now / 1000 + 3600 },
+					secondary_window: { used_percent: 15, limit_window_seconds: 604800, reset_at: now / 1000 + 86400 },
+				},
+			}),
+			{ status: 200 },
+		);
+	};
+	const client = createQuotaClient((id) => (id === "openai-codex" ? credential : undefined), mockFetch, () => now);
+	const first = await client.fetchUsage();
+	assert.equal(calls, 1);
+	assert.equal(compactStatus(first), "Codex 5h 72% left · W 85% left");
+	assert.match(detailed(first), /72\.0% remaining/);
+	await client.fetchUsage();
+	assert.equal(calls, 1, "cached for at least 60s");
+	now += 60_001;
+	await client.fetchUsage();
+	assert.equal(calls, 2, "poll refreshes after cache expires");
+});
+
+test("codex client auth and network states keep their legacy messages", async () => {
+	let now = NOW;
+	const token = tokenFor(now + 3_600_000);
+	const credential = { type: "oauth", access: token };
+	const never = async () => {
+		throw new Error("must not fetch");
+	};
+
+	await assert.rejects(createQuotaClient(() => ({ type: "oauth", access: token, expires: now - 1 }), never, () => now).fetchUsage(), /Auth expired/);
+	await assert.rejects(createQuotaClient(() => credential, async () => new Response("", { status: 401 }), () => now).fetchUsage(), /Auth expired/);
+	await assert.rejects(createQuotaClient(() => undefined, never, () => now).fetchUsage(), /Auth unavailable/);
+	await assert.rejects(createQuotaClient(() => credential, async () => new Response("boom", { status: 500 }), () => now).fetchUsage(), /usage service unavailable/);
+	await assert.rejects(createQuotaClient(() => credential, async () => new Response("nope", { status: 404 }), () => now).fetchUsage(), /usage service unavailable/);
+
+	const offline = createQuotaClient(() => credential, async () => {
+		throw new Error("offline");
+	}, () => now);
+	await assert.rejects(offline.fetchUsage(), /N\/A/);
+	await assert.rejects(offline.fetchUsage(), /temporarily unavailable/, "failures back off for the cache window");
+
+	const html = createQuotaClient(() => credential, async () => new Response("<html>login</html>", { status: 200 }), () => now);
+	await assert.rejects(html.fetchUsage(), /invalid usage response|windows missing/);
+});
+
+test("codex footer text stays legacy-compatible and shows N/A for missing windows", async () => {
+	const empty = { provider: "codex", source: "endpoint", fetchedAt: NOW };
+	assert.equal(compactStatus(empty), "Codex 5h N/A · W N/A");
+	assert.equal(
+		formatStatusLine([{ provider: "codex", fallback: "Codex: N/A", snapshot: empty }]),
+		"Codex: N/A",
+		"the footer shows N/A when no window is known",
+	);
+	const partial = { provider: "codex", source: "endpoint", fetchedAt: NOW, fiveHour: { used: 33.4, resetAt: NOW + 60_000 } };
+	assert.equal(compactStatus(partial), "Codex 5h 67% left · W N/A", "a missing weekly window keeps the legacy bare N/A wording");
+	assert.match(detailed(partial, NOW), /33\.4% used/);
+});
+
+// --------------------------------------------------------------------------------
+// Claude payload and header parsing
+// --------------------------------------------------------------------------------
+
+test("claude payload normalizes percents, reset formats, and unknown windows", () => {
+	const snapshot = parseClaudeUsagePayload(
+		{
+			five_hour: { utilization: 3, resets_at: "2026-11-09T01:50:00.000Z" },
+			seven_day: { utilization: 45.5, resets_at: 1791825600 },
+			seven_day_opus: null,
+			seven_day_sonnet: { utilization: 0.5, resets_at: 1791825600000 },
+			usage: { credits_system: { included: { enabled: false, disabled_reason: "subscription", spend_limit_reached: false } }, has_credits: false },
+			seven_day_breakdown: { rows: [{ key: "user_code", label: "Claude Code", utilization: 0.5 }, { key: "other", label: "Other", utilization: 0 }] },
+			limits: [{ kind: "model", limit: "weekly_all", limit_duration: "7d", utilization: 40, is_active: true, severity: "warning" }],
+		},
+		1000,
+	);
+	assert.ok(snapshot);
+	assert.equal(snapshot.fiveHour.used, 3);
+	assert.equal(new Date(snapshot.fiveHour.resetAt).toISOString(), "2026-11-09T01:50:00.000Z");
+	assert.equal(snapshot.weekly.used, 45.5, "weekly keeps the reported 45.5% rather than rounding");
+	assert.equal(snapshot.weekly.resetAt, 1791825600 * 1000, "epoch seconds are read as seconds");
+	const models = Object.fromEntries(snapshot.models.map((model) => [model.key, model.window]));
+	assert.equal(models.opus, undefined, "Opus stays unknown when the payload has no Opus limit");
+	assert.equal(models.sonnet.used, 50, "a 0.5 fraction is normalized to 50%");
+	assert.equal(snapshot.credits.enabled, false);
+	assert.equal(snapshot.credits.disabledReason, "subscription");
+	assert.equal(snapshot.breakdown[0].percent, 50);
+	assert.equal(snapshot.limitRows[0].severity, "warning");
+	assert.equal(snapshot.limitReached, undefined, "warnings do not mean the limit is reached");
+});
+
+test("claude payload and header garbage degrade instead of inventing numbers", () => {
+	assert.equal(parseClaudeUsagePayload(null, NOW), undefined);
+	assert.equal(parseClaudeUsagePayload({}, NOW), undefined);
+	assert.equal(parseClaudeUsagePayload({ five_hour: { utilization: "45%" } }, NOW), undefined);
+	assert.equal(parseClaudeUsageHeaders(undefined, NOW), undefined);
+	assert.equal(parseClaudeUsageHeaders({ "content-type": "application/json" }, NOW), undefined);
+	const snapshot = parseClaudeUsageHeaders(
+		{
+			"anthropic-ratelimit-unified-5h-utilization": "0.62",
+			"anthropic-ratelimit-unified-5h-reset": "1791825600",
+			"anthropic-ratelimit-unified-7d-utilization": "0.25",
+			"anthropic-ratelimit-unified-status": "allowed",
+		},
+		1000,
+	);
+	assert.equal(snapshot.fiveHour.used, 62);
+	assert.equal(snapshot.fiveHour.resetAt, 1791825600 * 1000);
+	assert.equal(snapshot.weekly.used, 25);
+	assert.equal(snapshot.weekly.resetAt, 0, "a missing reset header means reset time is unknown");
+	assert.equal(snapshot.source, "headers");
+	assert.equal(toPercent(1), 100, "1.0 is a full window, not 1%");
+	assert.equal(toPercent(99.4), 99.4, "values above 1 are already percents");
+});
+
+test("claude client surfaces auth, http, timeout, and backoff states", async () => {
+	let now = NOW;
+	const oauth = { type: "oauth", access: "a".repeat(20), expires: now + 3_600_000, refresh: "secret-refresh" };
+	const never = async () => {
+		throw new Error("must not fetch");
+	};
+	const base = (fetcher, credential) => ({ readCredential: () => credential, fetcher, now: () => now });
+
+	await assert.rejects(createClaudeQuotaClient(base(never, undefined)).getQuota(), /Auth unavailable/);
+	await assert.rejects(createClaudeQuotaClient(base(never, { type: "api_key", key: "sk-ant-" })).getQuota(), /N\/A/);
+	await assert.rejects(createClaudeQuotaClient(base(never, { ...oauth, expires: now - 1 })).getQuota(), /Auth expired/);
+
+	const logged = [];
+	const client = createClaudeQuotaClient(
+		base(async (url, init) => {
+			logged.push({ url, authorization: init.headers.Authorization, beta: init.headers["anthropic-beta"] });
+			return new Response(JSON.stringify({ five_hour: { utilization: 12, resets_at: 1791825600 }, seven_day: { utilization: 40 } }), { status: 200 });
+		}, oauth),
+	);
+	const snapshot = await client.getQuota();
+	assert.equal(snapshot.fiveHour.used, 12);
+	assert.equal(snapshot.source, "endpoint");
+	assert.match(logged[0].authorization, /^Bearer a+$/);
+	assert.ok(!logged[0].authorization.includes("secret-refresh"), "the refresh token is never sent");
+	assert.match(logged[0].beta, /oauth-2025-04-20/);
+	assert.equal(client.credentialKind(), "oauth");
+
+	const failing = createClaudeQuotaClient(
+		base(async () => {
+			return new Response("nope", { status: 404 });
+		}, oauth),
+	);
+	await assert.rejects(failing.getQuota(), /HTTP 404/);
+	await assert.rejects(failing.getQuota(), /N\/A/, "a failure backs off for the cache window");
+
+	const timedOut = createClaudeQuotaClient({
+		...base(async (_url, init) => {
+			await new Promise((_resolve, reject) =>
+				init.signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" }))),
+			);
+			return new Response("{}");
+		}, { ...oauth, expires: undefined, access: tokenFor(NOW + 3_600_000) }),
+		timeoutMs: 5,
+	});
+	await assert.rejects(timedOut.getQuota(), /timed out/);
+
+	const nonJson = createClaudeQuotaClient(base(async () => new Response("<html>cloudflare</html>", { status: 200 }), oauth));
+	await assert.rejects(nonJson.getQuota(), /non-JSON/);
+
+	const rateLimited = createClaudeQuotaClient(
+		base(async () => new Response("", { status: 429, headers: { "retry-after": "90" } }), oauth),
+	);
+	await assert.rejects(rateLimited.getQuota(), /rate limited/);
+});
+
+test("claude client asks Pi to refresh a stale token before reporting expiry", async () => {
+	const stale = { type: "oauth", access: "stale-access", expires: NOW - 1 };
+	const refreshed = { type: "oauth", access: "fresh-access", expires: NOW + 3_600_000 };
+
+	let minted = false;
+	let refreshAttempts = 0;
+	const logged = [];
+	const recovered = createClaudeQuotaClient({
+		readCredential: () => (minted ? refreshed : stale),
+		fetcher: async (_url, init) => {
+			logged.push(init.headers.Authorization);
+			return new Response(JSON.stringify({ five_hour: { utilization: 7 } }), { status: 200 });
+		},
+		now: () => NOW,
+		refreshCredential: async () => {
+			refreshAttempts += 1;
+			minted = true;
+		},
+	});
+
+	const snapshot = await recovered.getQuota();
+	assert.equal(snapshot.fiveHour.used, 7);
+	assert.equal(refreshAttempts, 1, "stale token gives Pi exactly one refresh chance");
+	assert.deepEqual(logged, ["Bearer fresh-access"], "the re-read credential is used for the request");
+
+	const broken = createClaudeQuotaClient({
+		readCredential: () => stale,
+		fetcher: async () => {
+			throw new Error("must not fetch");
+		},
+		now: () => NOW,
+		refreshCredential: async () => {
+			throw new Error("OAuth refresh failed for anthropic");
+		},
+	});
+	await assert.rejects(broken.getQuota(), /Auth expired/, "a failed Pi refresh keeps the expired verdict");
+});
+
+test("claude client caches, merges header data, and force-refreshes", async () => {
+	let calls = 0;
+	let now = NOW;
+	const client = createClaudeQuotaClient({
+		now: () => now,
+		readCredential: () => ({ type: "oauth", access: "a".repeat(20), expires: now + 3_600_000 }),
+		fetcher: async () => {
+			calls++;
+			return new Response(JSON.stringify({ five_hour: { utilization: 10, resets_at: 1791825600 } }), { status: 200 });
+		},
+	});
+	await client.getQuota();
+	await client.getQuota();
+	assert.equal(calls, 1, "endpoint data caches for 60s");
+	now += 30_000;
+	assert.equal(client.ingestHeaders({ "anthropic-ratelimit-unified-7d-utilization": "0.55" }), true);
+	const cached = client.peek();
+	assert.ok(Math.abs(cached.weekly.used - 55) < 1e-9, "headers add the weekly window");
+	assert.equal(cached.fiveHour.used, 10, "headers keep the endpoint window");
+	assert.equal(cached.source, "mixed");
+	assert.equal(cached.fetchedAt, now, "header data counts as fresh");
+	await client.getQuota();
+	assert.equal(calls, 1, "fresh header data does not trigger an endpoint call");
+	now += 60_001;
+	await client.getQuota(true);
+	assert.equal(calls, 2, "a forced refresh bypasses the cache");
+	assert.equal(client.ingestHeaders({}), false, "headers without rate-limit fields are ignored");
+});
+
+// --------------------------------------------------------------------------------
+// Display layer (synthetic data by design: this is what checks rendering)
+// --------------------------------------------------------------------------------
+
+const plain = (entries, options) => formatStatusLine(entries, options);
+
+test("claude footer shows 5h, weekly, Opus/Sonnet, and N/A when unreported", () => {
+	const entry = {
+		provider: "claude",
+		fallback: "Claude: N/A",
+		snapshot: {
+			provider: "claude",
+			source: "endpoint",
+			fetchedAt: NOW,
+			fiveHour: { used: 3.4, resetAt: NOW + 3 * 3600_000 },
+			weekly: { used: 45.2, resetAt: NOW + 2 * 86_400_000 },
+			models: [
+				{ key: "opus", label: "Opus", window: undefined },
+				{ key: "sonnet", label: "Sonnet", window: { used: 40, resetAt: NOW + 86_400_000 } },
+				{ key: "oauth-apps", label: "OAuth apps", window: undefined },
+			],
+		},
+	};
+	assert.equal(plain([entry]), "Claude 5h 97% left · W 55% left · Opus N/A · Sonnet 60% left");
+	assert.doesNotMatch(plain([entry]), /OAuth apps/, "an unreported OAuth-apps limit stays hidden");
+	const reported = { ...entry, snapshot: { ...entry.snapshot, models: [...entry.snapshot.models, { key: "oauth-apps", label: "OAuth apps", window: { used: 10, resetAt: NOW } }] } };
+	assert.match(plain([reported]), /OAuth apps 90% left/, "a reported OAuth-apps limit is shown");
+	assert.equal(plain([entry], { short: true }), "Claude 5h 97% · W 55% · Sonnet 60%");
+	const report = formatDetailedReport([entry], {});
+	assert.ok(report.split("\n").length >= 5, "one item per line in the detailed report");
+	assert.doesNotMatch(report, /remaining,week/, "lines end with newlines, not commas");
+	assert.match(report, /5-hour: 3\.4% used · 96\.6% remaining/);
+	assert.match(report, /weekly \(all models\): 45\.2% used · 54\.8% remaining/);
+	assert.match(report, /Opus weekly: N\/A/);
+	assert.match(report, /Sonnet weekly: 40\.0% used/);
+});
+
+test("claude footer shows N/A rather than zeros when nothing is reported", () => {
+	const empty = { provider: "claude", source: "endpoint", fetchedAt: NOW };
+	assert.equal(plain([{ provider: "claude", fallback: "Claude: N/A", snapshot: empty }]), "Claude: N/A");
+	assert.equal(plain([{ provider: "claude", fallback: "Claude: Auth unavailable" }]), "Claude: Auth unavailable");
+	assert.equal(plain([{ provider: "claude", fallback: "Claude: N/A", snapshot: { ...empty, weekly: undefined, fiveHour: undefined } }], { short: true }), "Claude: N/A");
+});
+
+test("footer marks stale data and keeps the last successful values", () => {
+	const entry = {
+		provider: "claude",
+		fallback: "Claude: N/A",
+		snapshot: { provider: "claude", source: "endpoint", fetchedAt: NOW - 30 * 60_000, fiveHour: { used: 20, resetAt: NOW }, weekly: { used: 30, resetAt: NOW } },
+		error: { code: "network", message: "Claude usage request failed" },
+		staleMs: 30 * 60_000,
+	};
+	assert.equal(plain([entry]), "Claude 5h 80% left · W 70% left · stale 30m");
+	const report = formatDetailedReport([entry], {});
+	assert.match(report, /\(stale 30m — last successful read\)/);
+	assert.match(report, /5-hour: 20\.0% used/, "stale data still shows the last values");
+	assert.match(report, /hint: showing the last successful read/);
+});
+
+test("both mode joins providers on one footer line", () => {
+	const claude = {
+		provider: "claude",
+		fallback: "Claude: N/A",
+		snapshot: { provider: "claude", source: "endpoint", fetchedAt: NOW, fiveHour: { used: 5, resetAt: NOW }, weekly: { used: 50, resetAt: NOW } },
+	};
+	const codex = {
+		provider: "codex",
+		fallback: "Codex: N/A",
+		snapshot: { provider: "codex", source: "endpoint", fetchedAt: NOW, fiveHour: { used: 82, resetAt: NOW }, weekly: { used: 63, resetAt: NOW } },
+	};
+	assert.equal(plain([codex, claude], { short: true }), "Codex 5h 18% · W 37% | Claude 5h 95% · W 50%");
+	assert.equal(
+		plain([{ provider: "codex", fallback: "Codex: Auth unavailable" }, { provider: "claude", fallback: "Claude: Auth unavailable" }], { short: true }),
+		"Codex: Auth unavailable | Claude: Auth unavailable",
+	);
+	assert.equal(plain([claude]), "Claude 5h 95% left · W 50% left", "single provider mode uses the long format");
+});
+
+test("nested colors keep each segment's own color and never leak forward", () => {
+	const calls = [];
+	const paint = (token, text) => {
+		calls.push(token);
+		return `«${token}:${text}»`;
+	};
+	const entry = {
+		provider: "claude",
+		fallback: "Claude: N/A",
+		snapshot: { provider: "claude", source: "endpoint", fetchedAt: NOW, fiveHour: { used: 95, resetAt: NOW }, weekly: { used: 10, resetAt: NOW } },
+	};
+	const colored = formatStatusLine([entry], { paint });
+	assert.equal(plain([entry]), "Claude 5h 5% left · W 90% left");
+	// Spans are painted from the last segment backwards, so the parent's color
+	// code is emitted before the child's reset instead of after it.
+	assert.deepEqual(calls, ["dim", "error"]);
+	assert.equal(colored, "«error:Claude 5h 5% left · «dim:W 90% left»»");
+	const tokens = (text) => [...text.matchAll(/«(\w+):/g)].map((match) => match[1]);
+	const warning = formatStatusLine(
+		[{ ...entry, snapshot: { ...entry.snapshot, fiveHour: { used: 80, resetAt: NOW }, weekly: { used: 95, resetAt: NOW } } }],
+		{ paint: (token, text) => `«${token}:${text}»` },
+	);
+	assert.deepEqual(tokens(warning), ["warning", "error"]);
+});
+
+test("detailed report explains modes, sources, and credential states", () => {
+	const claude = {
+		provider: "claude",
+		fallback: "Claude: N/A",
+		snapshot: {
+			provider: "claude",
+			source: "headers",
+			fetchedAt: NOW,
+			fiveHour: { used: 5, resetAt: NOW + 3600_000 },
+			models: [{ key: "opus", label: "Opus", window: undefined }],
+			credits: { enabled: false, disabledReason: "subscription" },
+			limitRows: [{ kind: "model", limit: "weekly_all", percent: 96, severity: "warning", isActive: true }],
+		},
+	};
+	const report = formatDetailedReport([claude], { mode: "both", reason: "mode=both" });
+	assert.match(report, /source: response headers/);
+	assert.match(report, /weekly_all 96% warning \(active\)/);
+	assert.match(report, /usage credits: disabled \(subscription\)/);
+	assert.match(report, /Mode: both .*mode=both/);
+	assert.match(report, /resets in \d/);
+
+	const auth = formatDetailedReport([{ provider: "claude", fallback: "Claude: N/A", error: { code: "auth-unavailable", message: "Claude: Auth unavailable" } }], {});
+	assert.match(auth, /Claude quota unavailable: Claude: Auth unavailable/);
+	assert.match(auth, /\/login and choose anthropic/);
+	const apiKey = formatDetailedReport([{ provider: "claude", fallback: "Claude: N/A", error: { code: "api-key-auth", message: "Claude: N/A" } }], {});
+	assert.match(apiKey, /subscription usage needs OAuth/);
+	const scopes = formatDetailedReport([{ provider: "claude", fallback: "Claude: N/A", error: { code: "oauth-no-usage", message: "Claude: N/A" } }], {});
+	assert.match(scopes, /lacks the usage scopes/);
+});
+
+// --------------------------------------------------------------------------------
+// Settings + provider resolution
+// --------------------------------------------------------------------------------
+
+test("settings store defaults, round-trips, survives garbage, keeps unknown keys", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-quota-settings-"));
+	const store = createSettingsStore(dir);
+	assert.deepEqual(store.read(), { version: 1, mode: "auto", lastSubscriptionProvider: null }, "missing file gives defaults");
+
+	const written = store.write({ mode: "claude", lastSubscriptionProvider: "anthropic", futureOption: { keep: true } });
+	assert.equal(written.mode, "claude");
+	assert.equal(written.lastSubscriptionProvider, "anthropic");
+	assert.equal(store.read().futureOption.keep, true, "unknown keys survive a rewrite");
+	const file = readFileSync(join(dir, "quota-usage.json"), "utf8");
+	assert.doesNotMatch(file, /sk-|Bearer|access_token|refresh_token/i, "the settings file stores no credentials");
+
+	writeFileSync(join(dir, "quota-usage.json"), "{not json", "utf8");
+	assert.deepEqual(store.read(), { version: 1, mode: "auto", lastSubscriptionProvider: null }, "a corrupt file falls back to defaults");
+
+	writeFileSync(join(dir, "quota-usage.json"), JSON.stringify({ mode: "bogus", lastSubscriptionProvider: "evil", version: 99 }), "utf8");
+	const normalized = store.read();
+	assert.equal(normalized.mode, "auto");
+	assert.equal(normalized.lastSubscriptionProvider, null);
+	assert.deepEqual(normalizeSettings(null), { version: 1, mode: "auto", lastSubscriptionProvider: null });
+	assert.deepEqual(normalizeSettings([]), { version: 1, mode: "auto", lastSubscriptionProvider: null });
+
+	const deep = createSettingsStore(join(dir, "nested-deeper", "deep"));
+	assert.equal(deep.write({ mode: "both" }).mode, "both", "writes create missing directories");
+	rmSync(dir, { recursive: true, force: true });
+});
+
+test("resolveTargets maps every mode and keeps the subscription for local models", () => {
+	assert.deepEqual(resolveTargets({ mode: "codex" }), { targets: ["codex"], inherited: false, reason: "mode=codex" });
+	assert.deepEqual(resolveTargets({ mode: "claude" }), { targets: ["claude"], inherited: false, reason: "mode=claude" });
+	assert.deepEqual(resolveTargets({ mode: "both" }), { targets: ["codex", "claude"], inherited: false, reason: "mode=both" });
+	assert.equal(resolveTargets({ mode: "auto", activeProvider: "anthropic" }).targets.join(), "claude");
+	assert.equal(resolveTargets({ mode: "auto", activeProvider: "openai-codex" }).targets.join(), "codex");
+	const local = resolveTargets({ mode: "auto", activeProvider: "strata-auto", lastSubscriptionProvider: "anthropic" });
+	assert.deepEqual(local, {
+		targets: ["claude"],
+		inherited: true,
+		reason: "no subscription model active (provider: strata-auto); showing last subscription provider anthropic",
+	});
+	assert.equal(resolveTargets({ mode: "auto", activeProvider: "strata-auto", lastSubscriptionProvider: "openai-codex" }).targets.join(), "codex");
+	assert.equal(resolveTargets({ mode: "auto", activeProvider: "lmstudio", credentialKinds: { claude: "usable", codex: "none" } }).reason, "only a Claude subscription login was found");
+	assert.equal(resolveTargets({ mode: "auto", activeProvider: "lmstudio", credentialKinds: { claude: "none", codex: "usable" } }).reason, "only a Codex subscription login was found");
+	assert.equal(
+		resolveTargets({ mode: "auto", activeProvider: "lmstudio" }).reason,
+		"no subscription provider detected, defaulting to Codex (change with /quota-provider)",
+	);
+	assert.equal(providerKind("github-copilot/claude", ["github-copilot/claude"], ["openai-codex"]), "claude");
+	assert.equal(providerKind("strata-auto", ["anthropic"], ["openai-codex"]), undefined);
+});
+
+test("credential detection separates API keys, scoped logins, and absences", () => {
+	const both = { anthropic: { type: "oauth", access: "x", scopes: ["user:profile"] }, "openai-codex": { type: "api_key", key: "sk" } };
+	assert.deepEqual(detectCredentialKinds((provider) => both[provider]), { claude: "usable", codex: "api-key" });
+	assert.deepEqual(
+		detectCredentialKinds((provider) => ({ anthropic: { type: "oauth", access: "x", scopes: "user:minimal" } })[provider], ["user:profile"]),
+		{ claude: "oauth-no-usage", codex: "none" },
+	);
+	assert.deepEqual(detectCredentialKinds(() => undefined), { claude: "none", codex: "none" });
+});
+
+// --------------------------------------------------------------------------------
+// Extension integration: commands, events, and the no-credential N/A paths
+// --------------------------------------------------------------------------------
+
+function createHarness() {
+	const dir = mkdtempSync(join(tmpdir(), "pi-quota-ext-"));
+	const previous = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = dir;
+	const statuses = new Map();
+	const notifications = [];
+	const commands = new Map();
+	const handlers = new Map();
+	const tokens = [];
+	const context = {
+		hasUI: true,
+		model: undefined,
+		ui: {
+			theme: { fg: (token, text) => (tokens.push(token), text) },
+			setStatus: (key, text) => {
+				if (text === undefined) statuses.delete(key);
+				else statuses.set(key, text);
+			},
+			notify: (text, level) => notifications.push({ text, level }),
+			select: async () => undefined,
+		},
+	};
+	extensionDefault({
+		registerCommand: (name, options) => commands.set(name, options),
+		on: (event, handler) => {
+			const list = handlers.get(event) ?? [];
+			handlers.set(event, list);
+			list.push(handler);
+			return () => {};
+		},
+	});
+	return {
+		dir,
+		statuses,
+		notifications,
+		commands,
+		tokens,
+		context,
+		setModel(provider) {
+			context.model = { provider, id: `${provider}-model`, name: provider };
+		},
+		async emit(event, payload) {
+			for (const handler of handlers.get(event) ?? []) await handler(payload ?? { type: event }, context);
+		},
+		async command(name, args = "") {
+			const command = commands.get(name);
+			assert.ok(command, `/${name} is registered`);
+			await command.handler(args, context);
+			return notifications.at(-1);
+		},
+		async settle() {
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		},
+		/** Polls a condition so fire-and-forget footer refreshes do not need extra sleeps. */
+		async waitFor(condition, attempts = 60) {
+			for (let index = 0; index < attempts; index++) {
+				if (condition()) return;
+				await new Promise((resolve) => setTimeout(resolve, 10));
+			}
+			assert.fail(`footer never settled; statuses=${JSON.stringify([...statuses])}`);
+		},
+		async waitForStatus(expected) {
+			await this.waitFor(() => statuses.get(STATUS_KEY) === expected);
+			assert.equal(statuses.get(STATUS_KEY), expected);
+		},
+		async cleanup() {
+			await this.emit("session_shutdown", { reason: "test" });
+			if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previous;
+			rmSync(dir, { recursive: true, force: true });
+		},
+	};
+}
+
+test("extension registers every command and shows N/A without credentials", async (t) => {
+	const harness = createHarness();
+	t.after(() => harness.cleanup());
+
+	assert.deepEqual([...harness.commands.keys()].sort(), ["claude-quota", "codex-quota", "quota", "quota-provider"]);
+
+	harness.setModel("openai-codex");
+	await harness.emit("session_start", { reason: "startup" });
+	await harness.settle();
+	assert.equal(harness.statuses.get(STATUS_KEY), "Codex: Auth unavailable", "logged-out Codex shows N/A style text");
+
+	harness.setModel("strata-auto");
+	await harness.emit("turn_end", {});
+	await harness.emit("after_provider_response", { status: 200, headers: {} });
+	await harness.settle();
+	assert.equal(harness.statuses.get(STATUS_KEY), "Codex: Auth unavailable", "turn_end only polls Codex for Codex models");
+
+	assert.match((await harness.command("quota")).text, /Codex quota unavailable/);
+	assert.match((await harness.command("claude-quota")).text, /Claude quota unavailable: Claude: Auth unavailable/);
+	assert.match((await harness.command("codex-quota")).text, /Codex quota unavailable/);
+	assert.equal(harness.notifications.at(-1).level, "warning", "failures notify as warnings");
+});
+
+test("quota-provider validates, persists, and switches modes", async (t) => {
+	const harness = createHarness();
+	t.after(() => harness.cleanup());
+
+	const bad = await harness.command("quota-provider", "everything");
+	assert.equal(bad.level, "warning");
+	assert.match(bad.text, /Unknown quota provider mode "everything"/);
+	for (const mode of ["auto", "codex", "claude", "both"]) assert.match(bad.text, new RegExp(`${mode} —`));
+
+	const listed = await harness.command("quota-provider", "list");
+	assert.match(listed.text, /Quota provider mode: auto/);
+	for (const mode of ["auto", "codex", "claude", "both"]) assert.match(listed.text, new RegExp(`^${mode} — `, "m"));
+
+	const setClaude = await harness.command("quota-provider", "CLAUDE");
+	assert.equal(setClaude.level, "info");
+	assert.match(setClaude.text, /^claude — always show Claude subscription quota/);
+	const settingsFile = () => readFileSync(join(harness.dir, "quota-usage.json"), "utf8");
+	assert.match(settingsFile(), /"mode": "claude"/);
+	await harness.settle();
+	assert.equal(harness.statuses.get(STATUS_KEY), "Claude: Auth unavailable", "mode=claude drives the footer");
+
+	harness.setModel("strata-auto");
+	await harness.emit("model_select", { model: harness.context.model, previousModel: undefined, source: "set" });
+	assert.match(settingsFile(), /"mode": "claude"/, "model selection never changes the mode");
+
+	harness.context.ui.select = async () => "both — show Codex and Claude on one line (short format)";
+	await harness.command("quota-provider", "");
+	assert.match(settingsFile(), /"mode": "both"/);
+	await harness.waitFor(() => / \| /.test(harness.statuses.get(STATUS_KEY) ?? ""));
+	assert.match(harness.statuses.get(STATUS_KEY), /Codex: Auth unavailable \| Claude: Auth unavailable/, "both mode shares one footer line");
+
+	const completions = harness.commands.get("quota-provider").getArgumentCompletions("bo");
+	assert.deepEqual(completions.map((item) => item.value), ["both"]);
+	await harness.command("quota-provider", "auto");
+	assert.match(settingsFile(), /"mode": "auto"/);
+});
+
+test("model_select persists the last subscription provider for local-model fallback", async (t) => {
+	const harness = createHarness();
+	t.after(() => harness.cleanup());
+
+	harness.setModel("anthropic");
+	await harness.emit("model_select", { model: harness.context.model, previousModel: undefined, source: "set" });
+	await harness.waitForStatus("Claude: Auth unavailable");
+	const settingsFile = () => readFileSync(join(harness.dir, "quota-usage.json"), "utf8");
+	assert.match(settingsFile(), /"lastSubscriptionProvider": "anthropic"/, "the Claude login is remembered for local models");
+
+	harness.setModel("openai-codex");
+	await harness.emit("model_select", { model: harness.context.model, previousModel: undefined, source: "cycle" });
+	await harness.waitForStatus("Codex: Auth unavailable");
+	assert.match(settingsFile(), /"lastSubscriptionProvider": "openai-codex"/);
+
+	harness.setModel("strata-auto");
+	await harness.emit("model_select", { model: harness.context.model, previousModel: undefined, source: "restore" });
+	await harness.waitForStatus("Codex: Auth unavailable");
+	const local = await harness.command("quota");
+	assert.match(local.text, /showing last subscription provider openai-codex/, "a local model keeps the last subscription account");
+
+	await harness.emit("session_shutdown", { reason: "test" });
+	assert.equal(harness.statuses.has(STATUS_KEY), false, "the footer entry is cleared on shutdown");
+});
+
+test("claude response headers update the footer without extra polling", async (t) => {
+	const harness = createHarness();
+	t.after(() => harness.cleanup());
+
+	harness.setModel("anthropic");
+	await harness.emit("model_select", { model: harness.context.model, previousModel: undefined, source: "set" });
+	await harness.settle();
+	assert.equal(harness.statuses.get(STATUS_KEY), "Claude: Auth unavailable");
+
+	await harness.emit("after_provider_response", {
+		status: 200,
+		headers: {
+			"anthropic-ratelimit-unified-5h-utilization": "0.4",
+			"anthropic-ratelimit-unified-7d-utilization": "0.2",
+			"anthropic-ratelimit-unified-5h-reset": String(Math.round(NOW / 1000 + 7200)),
+		},
+	});
+	await harness.waitForStatus("Claude 5h 60% left · W 80% left");
+	assert.ok(harness.tokens.length > 0, "the footer is painted with theme colors");
+});
+
+test("claude mode keeps the footer independent of the active model", async (t) => {
+	const harness = createHarness();
+	t.after(() => harness.cleanup());
+
+	await harness.command("quota-provider", "claude");
+	harness.setModel("openai-codex");
+	await harness.emit("model_select", { model: harness.context.model, previousModel: undefined, source: "set" });
+	await harness.settle();
+	assert.equal(harness.statuses.get(STATUS_KEY), "Claude: Auth unavailable", "a Codex model does not override mode=claude");
+
+	harness.setModel("strata-auto");
+	await harness.emit("turn_end", {});
+	await harness.settle();
+	assert.equal(harness.statuses.get(STATUS_KEY), "Claude: Auth unavailable");
+});

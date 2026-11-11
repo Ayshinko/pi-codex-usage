@@ -1,0 +1,150 @@
+import { type ExtensionAPI, readStoredCredential } from "@earendil-works/pi-coding-agent";
+
+const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+const CACHE_MS = 60_000;
+const TIMEOUT_MS = 5_000;
+
+type Quota = { used: number; resetAt: number };
+type Usage = { fiveHour?: Quota; weekly?: Quota; plan?: string; limitReached?: boolean; fetchedAt: number };
+type Fetcher = (url: string, init: RequestInit) => Promise<Response>;
+type CredentialReader = (provider: string) => unknown;
+
+function jwtExpiryMs(token: string): number | undefined {
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return undefined;
+    const json = JSON.parse(Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"));
+    return typeof json.exp === "number" ? json.exp * 1000 : undefined;
+  } catch { return undefined; }
+}
+
+function resetText(ms: number): string {
+  if (!ms) return "unknown";
+  const mins = Math.max(0, Math.ceil((ms - Date.now()) / 60_000));
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  return hours < 24 ? `${hours}h ${mins % 60}m` : `${Math.floor(hours / 24)}d ${hours % 24}h`;
+}
+
+export function remainingLine(name: string, quota?: Quota): string {
+  return quota ? `${name} ${Math.round(100 - quota.used)}% left` : `${name} N/A`;
+}
+
+export function createQuotaClient(
+  readCredential: CredentialReader = readStoredCredential,
+  fetcher: Fetcher = fetch,
+  now: () => number = Date.now,
+) {
+  let cached: Usage | undefined;
+  let pending: Promise<Usage> | undefined;
+  let failedUntil = 0;
+
+  async function fetchUsage(force = false): Promise<Usage> {
+    if (!force && cached && now() - cached.fetchedAt < CACHE_MS) return cached;
+    if (pending) return pending;
+    if (now() < failedUntil) throw new Error("Codex: N/A (request temporarily unavailable)");
+    pending = (async () => {
+      const raw = readCredential("openai-codex") as { type?: string; access?: string; accountId?: string; expires?: number } | undefined;
+      if (!raw || raw.type !== "oauth" || !raw.access) throw new Error("Codex: Auth unavailable");
+      const exp = raw.expires && raw.expires > 0 ? raw.expires : jwtExpiryMs(raw.access);
+      if (exp !== undefined && exp <= now()) throw new Error("Codex: Auth expired");
+      const headers: Record<string, string> = { Authorization: `Bearer ${raw.access}`, Accept: "application/json" };
+      if (raw.accountId) headers["ChatGPT-Account-Id"] = raw.accountId;
+      let response: Response;
+      try {
+        response = await fetcher(USAGE_URL, { headers, signal: AbortSignal.timeout(TIMEOUT_MS) });
+      } catch {
+        failedUntil = now() + CACHE_MS;
+        throw new Error("Codex: N/A (usage request failed)");
+      }
+      if (response.status === 401 || response.status === 403) {
+        failedUntil = now() + CACHE_MS;
+        throw new Error("Codex: Auth expired");
+      }
+      if (!response.ok) {
+        failedUntil = now() + CACHE_MS;
+        throw new Error("Codex: N/A (usage service unavailable)");
+      }
+      let body: any;
+      try { body = await response.json(); } catch {
+        failedUntil = now() + CACHE_MS;
+        throw new Error("Codex: N/A (invalid usage response)");
+      }
+      const windows = [body?.rate_limit?.primary_window, body?.rate_limit?.secondary_window].filter(Boolean);
+      const usage: Usage = { fetchedAt: now(), plan: body?.plan_type, limitReached: body?.rate_limit?.limit_reached };
+      for (const w of windows) {
+        if (typeof w.used_percent !== "number" || !Number.isFinite(w.used_percent)) continue;
+        const quota = { used: Math.max(0, Math.min(100, w.used_percent)), resetAt: typeof w.reset_at === "number" ? w.reset_at * 1000 : 0 };
+        if ((w.limit_window_seconds ?? 0) <= 21600) usage.fiveHour = quota;
+        else usage.weekly = quota;
+      }
+      if (!usage.fiveHour && !usage.weekly) throw new Error("Codex: N/A (quota windows missing)");
+      cached = usage;
+      failedUntil = 0;
+      return usage;
+    })().finally(() => { pending = undefined; });
+    return pending;
+  }
+  return { fetchUsage, invalidate: () => { cached = undefined; } };
+}
+
+function compactStatus(usage: Usage): string {
+  const left = (q?: Quota) => q ? `${Math.round(100 - q.used)}% left` : "N/A";
+  return `Codex 5h ${left(usage.fiveHour)} · W ${left(usage.weekly)}`;
+}
+
+function detailed(usage: Usage): string {
+  const line = (label: string, quota?: Quota) => quota
+    ? `${label}: ${quota.used.toFixed(1)}% used · ${(100 - quota.used).toFixed(1)}% remaining · resets in ${resetText(quota.resetAt)}`
+    : `${label}: N/A`;
+  return ["Codex quota", line("5-hour", usage.fiveHour), line("Weekly", usage.weekly), ...(usage.plan ? [`Plan: ${usage.plan}`] : []), ...(usage.limitReached ? ["Rate limit reached"] : [])].join("\n");
+}
+
+export default function (pi: ExtensionAPI) {
+  const client = createQuotaClient();
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let currentCtx: any;
+  let busy = false;
+
+  async function update(ctx: any, force = false): Promise<Usage | undefined> {
+    if (busy) return undefined;
+    busy = true;
+    try {
+      const usage = await client.fetchUsage(force);
+      currentCtx = ctx;
+      if (ctx.hasUI) ctx.ui.setStatus("codex-quota", compactStatus(usage));
+      return usage;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Codex: N/A";
+      currentCtx = ctx;
+      if (ctx.hasUI) ctx.ui.setStatus("codex-quota", message.startsWith("Codex: Auth") ? message : "Codex: N/A");
+      return undefined;
+    } finally { busy = false; }
+  }
+
+  pi.registerCommand("codex-quota", {
+    description: "Show Codex 5-hour and weekly quota and reset times",
+    handler: async (_args, ctx) => {
+      const usage = await update(ctx, true);
+      ctx.ui.notify(usage ? detailed(usage) : "Codex quota unavailable. Check /auth openai-codex; no credentials were changed.", usage ? "info" : "warning");
+    },
+  });
+
+  pi.on("session_start", (_event, ctx) => {
+    currentCtx = ctx;
+    void update(ctx);
+    timer = setInterval(() => { if (currentCtx) void update(currentCtx); }, CACHE_MS);
+  });
+  pi.on("message_end", (event: any, ctx) => {
+    if (event.message?.role === "assistant" && ctx.model?.provider === "openai-codex") void update(ctx);
+  });
+  pi.on("session_shutdown", (_event, ctx) => {
+    if (timer) clearInterval(timer);
+    timer = undefined;
+    if (ctx.hasUI) ctx.ui.setStatus("codex-quota", undefined);
+    currentCtx = undefined;
+  });
+}
+
+// Exported for tests without opening a live session.
+export { compactStatus, detailed, resetText };
